@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-import os, sys, argparse
+import os, sys, argparse, json
 from scripts.lib.discovery import plan
 from scripts.lib.logging_utils import RunLogger
 from scripts.lib.executor import get_connection, execute_file
-from scripts.lib.errors import DiscoveryError, ExecutionError
+from scripts.lib.errors import DiscoveryError
 
 def _env_summary():
     keys = ["ENVIRONMENT", "SCHEMA_NAME"]
@@ -24,13 +24,11 @@ def main():
     p.add_argument("--out-dir", default="", help="Directory to write run artifacts (evidence.json, logs, etc.)")
     args = p.parse_args()
 
-    # Normalize and prepare output directory
     out_dir = args.out_dir.strip()
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
         logger = RunLogger(root_dir=out_dir)
     else:
-        # Fallback to previous behavior (whatever RunLogger uses by default)
         logger = RunLogger(root_dir="")
 
     try:
@@ -44,6 +42,11 @@ def main():
     except Exception as e:
         logger.error(str(e))
         logger.finalize(False)
+        # ensure evidence.json stub exists
+        if out_dir:
+            ev = {"summary": {"total_files": 0, "succeeded": 0, "failed": 0}, "results": []}
+            with open(os.path.join(out_dir, "evidence.json"), "w", encoding="utf-8") as f:
+                json.dump(ev, f)
         sys.exit(2)
 
     ok = True
@@ -55,7 +58,7 @@ def main():
                     name = os.path.basename(path)
                     try:
                         logger.info(f"Executing: {name}")
-                        res = execute_file(conn, path)  # returns dict with message/metrics
+                        res = execute_file(conn, path)
                         logger.step(name, "success", res)
                     except Exception as e:
                         logger.error(f"{name} failed: {e}")
@@ -72,6 +75,13 @@ def main():
                     ok = False
     finally:
         logger.finalize(ok)
+        # guarantee evidence.json exists
+        if out_dir:
+            ev_path = os.path.join(out_dir, "evidence.json")
+            if not os.path.exists(ev_path):
+                ev = {"summary": {"total_files": 0, "succeeded": 0, "failed": 0}, "results": []}
+                with open(ev_path, "w", encoding="utf-8") as f:
+                    json.dump(ev, f)
 
     sys.exit(0 if ok else 1)
 
