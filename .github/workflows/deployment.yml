@@ -1,0 +1,203 @@
+name: Redshift SQL Deploy (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Git branch to checkout"
+        required: true
+        type: string
+      sql_path:
+        description: "Path to a .sql file or a folder of .sql files"
+        required: true
+        type: string
+        default: "sql"
+      execution_order:
+        description: "Optional comma-separated filenames to enforce order when sql_path is a folder"
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare artifacts folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+      - name: Python syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import compileall, sys
+          ok = compileall.compile_dir('.', maxlevels=10, quiet=1)
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Discovery smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, time
+          from scripts.lib.discovery import plan
+          mode, files = plan("${{ inputs.sql_path }}", "${{ inputs.execution_order || '' }}")
+          print(f"Mode={mode}, files={files}")
+          os.makedirs("artifacts", exist_ok=True)
+          ts = time.strftime("%Y%m%d-%H%M%S")
+          with open(f"artifacts/discovery-{ts}.json","w") as f:
+            json.dump({"mode": mode, "files": files}, f, indent=2)
+          PY
+
+      # Strict secret gate — FAILS THE JOB HERE if anything is missing
+      - name: Require Redshift secrets
+        id: gate
+        shell: bash
+        env:
+          H: ${{ secrets.REDSHIFT_HOST }}
+          RPORT: ${{ secrets.REDSHIFT_PORT }}
+          DB: ${{ secrets.REDSHIFT_DB }}
+          U: ${{ secrets.REDSHIFT_USER }}
+          P: ${{ secrets.REDSHIFT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -z "${H}" ]     && missing+=("REDSHIFT_HOST")
+          [ -z "${RPORT}" ] && missing+=("REDSHIFT_PORT")
+          [ -z "${DB}" ]    && missing+=("REDSHIFT_DB")
+          [ -z "${U}" ]     && missing+=("REDSHIFT_USER")
+          [ -z "${P}" ]     && missing+=("REDSHIFT_PASSWORD")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      # Actual run — stream to console and save a copy
+      - name: Execute SQL
+        shell: bash
+        env:
+          REDSHIFT_HOST: ${{ secrets.REDSHIFT_HOST }}
+          REDSHIFT_PORT: ${{ secrets.REDSHIFT_PORT }}
+          REDSHIFT_DB: ${{ secrets.REDSHIFT_DB }}
+          REDSHIFT_USER: ${{ secrets.REDSHIFT_USER }}
+          REDSHIFT_PASSWORD: ${{ secrets.REDSHIFT_PASSWORD }}
+          ENVIRONMENT: ${{ vars.ENVIRONMENT || 'dev' }}
+          SCHEMA_NAME: ${{ vars.SCHEMA_NAME || 'demo' }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          python -m scripts.runner \
+            --sql-path "${{ inputs.sql_path }}" \
+            --execution-order "${{ inputs.execution_order }}" 2>&1 | tee artifacts/runner-console.log
+
+      # Find the latest artifacts/run-* directory (works even if the run failed)
+      - name: Find latest run directory
+        id: findrun
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_DIR="$(ls -1dt artifacts/run-* 2>/dev/null | head -n1 || true)"
+          if [ -z "${RUN_DIR}" ]; then
+            echo "::warning::No artifacts/run-* directory found (runner may have failed before writing evidence)."
+            echo "run_dir=" >> "$GITHUB_OUTPUT"
+            echo "run_name=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RUN_NAME="$(basename "${RUN_DIR}")"
+          echo "Found run directory: ${RUN_DIR}"
+          echo "run_dir=${RUN_DIR}" >> "$GITHUB_OUTPUT"
+          echo "run_name=${RUN_NAME}" >> "$GITHUB_OUTPUT"
+
+      # Print a clean, production-style summary into the Actions log
+      - name: Summarize evidence in logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ steps.findrun.outputs.run_dir }}" ]; then
+            echo "::notice::No run directory to summarize."
+            exit 0
+          fi
+          PYTHONUNBUFFERED=1 python - <<'PY'
+          import json, os, sys
+          run_dir = os.environ.get("RUN_DIR")
+          ev_path = os.path.join(run_dir, "evidence.json")
+          print(f"[INFO] Latest run dir: {run_dir}")
+          if not os.path.exists(ev_path):
+              print("::warning::evidence.json not found.")
+              sys.exit(0)
+          with open(ev_path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          def g(d, k, default=""): return d.get(k, default)
+
+          print("=== Evidence Summary (for operators) ===")
+          print(f"run_id: {g(data,'run_id')}")
+          print(f"environment: {g(data,'environment')}")
+          print(f"schema_name: {g(data,'schema_name')}")
+          summ = g(data,'summary',{})
+          print(f"files: {g(summ,'total_files')} | ok: {g(summ,'succeeded')} | failed: {g(summ,'failed')}")
+          print("Results:")
+          for r in g(data,'results',[]):
+              status = g(r,'status')
+              fname  = g(r,'file')
+              ms     = g(r,'elapsed_ms')
+              rows   = g(r,'rows_affected')
+              err    = g(r,'error')
+              if status == "failed" and err:
+                  print(f" - {fname}: FAILED in {ms} ms [{g(err,'code','?')}] {g(err,'message','')}")
+              else:
+                  print(f" - {fname}: {status.upper()} in {ms} ms rows={rows}")
+          print("=======================================")
+          PY
+        env:
+          RUN_DIR: ${{ steps.findrun.outputs.run_dir }}
+
+      # Upload artifacts for download: evidence.json, full run folder, and the console log
+      - name: Upload evidence.json
+        if: always() && steps.findrun.outputs.run_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-json
+          path: ${{ steps.findrun.outputs.run_dir }}/evidence.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload full run folder
+        if: always() && steps.findrun.outputs.run_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.findrun.outputs.run_name }}
+          path: ${{ steps.findrun.outputs.run_dir }}
+          retention-days: 30
+
+      - name: Upload runner console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-console
+          path: artifacts/runner-console.log
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,23 @@
+site_name: allwyn-test-2 — Redshift SQL Deploy
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+    - search.highlight
+    - toc.integrate
+markdown_extensions:
+  - admonition
+  - codehilite
+  - footnotes
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+nav:
+  - Home: index.md
+  - Runbook: runbook.md
+  - Architecture: architecture.md
+  - Ownership: ownership.md
